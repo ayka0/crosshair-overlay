@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+*.spec
+crosshair_config.json
+.venv/
+venv/
+env/
+.idea/
+.vscode/
+*.log
