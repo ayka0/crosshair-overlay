@@ -1,6 +1,8 @@
 import tkinter as tk
 from tkinter import colorchooser, ttk, simpledialog, messagebox, filedialog
-import json, os, sys, copy, threading
+import json, os, sys, copy, threading, queue
+import ctypes
+from ctypes import wintypes
 
 if getattr(sys, "frozen", False):
     BASE_DIR = os.path.dirname(sys.executable)
@@ -9,7 +11,6 @@ else:
 CONFIG_FILE = os.path.join(BASE_DIR, "crosshair_config.json")
 
 try:
-    import ctypes
     ctypes.windll.shcore.SetProcessDpiAwareness(2)
 except Exception:
     try:
@@ -24,7 +25,7 @@ try:
 except Exception:
     HAVE_TRAY = False
 
-CONFIG_VERSION = 4
+CONFIG_VERSION = 5
 
 THEMES = {
     "dark": {
@@ -54,8 +55,8 @@ HOTKEY_CHOICES = {
     "Page Up": 0x21, "Page Down": 0x22,
 }
 MOD_NOREPEAT = 0x4000
+WM_HOTKEY = 0x0312
 
-# ============ Только два прицела ============
 PRO_PRESETS = {
     "ZywOo": {
         "type": "cross",
@@ -70,15 +71,169 @@ PRO_PRESETS = {
         "dot": 2.0, "dot_color": "#00bfff",
     },
 }
-
 DEFAULT_PRESETS = copy.deepcopy(PRO_PRESETS)
-
 NEW_PRESET_TEMPLATE = {
     "type": "cross", "size": 10.0, "gap": 4.0, "thick": 1.5,
     "color": "#00ff00", "outline": "#000000", "show_outline": True,
     "dot": 0.0, "dot_color": "#00ff00",
 }
 
+
+# ============================================================
+#   GLOBAL HOTKEY MANAGER (message-only window + поток + очередь)
+# ============================================================
+user32 = ctypes.WinDLL("user32", use_last_error=True)
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+user32.CreateWindowExW.argtypes = [
+    wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+]
+user32.CreateWindowExW.restype = ctypes.c_void_p
+
+user32.RegisterClassW.argtypes = [ctypes.c_void_p]
+user32.RegisterClassW.restype = wintypes.ATOM
+
+user32.RegisterHotKey.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                  wintypes.UINT, wintypes.UINT]
+user32.RegisterHotKey.restype = wintypes.BOOL
+
+user32.UnregisterHotKey.argtypes = [ctypes.c_void_p, ctypes.c_int]
+user32.UnregisterHotKey.restype = wintypes.BOOL
+
+user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG),
+                               ctypes.c_void_p, wintypes.UINT, wintypes.UINT]
+user32.GetMessageW.restype = ctypes.c_int
+
+user32.DefWindowProcW.argtypes = [ctypes.c_void_p, wintypes.UINT,
+                                  wintypes.WPARAM, wintypes.LPARAM]
+user32.DefWindowProcW.restype = ctypes.c_long
+
+user32.PostMessageW.argtypes = [ctypes.c_void_p, wintypes.UINT,
+                                wintypes.WPARAM, wintypes.LPARAM]
+user32.PostMessageW.restype = wintypes.BOOL
+
+kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+kernel32.GetModuleHandleW.restype = ctypes.c_void_p
+
+
+class _WNDCLASS(ctypes.Structure):
+    _fields_ = [
+        ("style", wintypes.UINT),
+        ("lpfnWndProc", ctypes.c_void_p),
+        ("cbClsExtra", ctypes.c_int),
+        ("cbWndExtra", ctypes.c_int),
+        ("hInstance", ctypes.c_void_p),
+        ("hIcon", ctypes.c_void_p),
+        ("hCursor", ctypes.c_void_p),
+        ("hbrBackground", ctypes.c_void_p),
+        ("lpszMenuName", wintypes.LPCWSTR),
+        ("lpszClassName", wintypes.LPCWSTR),
+    ]
+
+
+_WNDPROC = ctypes.WINFUNCTYPE(
+    ctypes.c_long, ctypes.c_void_p, wintypes.UINT,
+    wintypes.WPARAM, wintypes.LPARAM
+)
+
+
+class GlobalHotkeyManager:
+    """Глобальные хоткеи через message-only окно в отдельном потоке."""
+
+    def __init__(self, on_hotkey):
+        """
+        on_hotkey(id: int, name: str) — вызывается в ГЛАВНОМ потоке через after().
+        name — произвольное имя, привязанное к RegisterHotKey.
+        """
+        self.on_hotkey = on_hotkey
+        self.hwnd = None
+        self.class_name = f"CrosshairHotkeyWnd_{os.getpid()}_{id(self)}"
+        self.hk_ids = {}   # name -> id
+        self.hk_keys = {}  # name -> vk
+        self._next_id = 1
+        self.ui_queue = queue.Queue()
+        self._wndproc_ref = None  # чтобы ctypes не собрал сборщик мусора
+
+    def start(self):
+        h_instance = kernel32.GetModuleHandleW(None)
+
+        def wnd_proc(hwnd, msg, wparam, lparam):
+            if msg == WM_HOTKEY:
+                self.ui_queue.put(int(wparam))
+            return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+        self._wndproc_ref = _WNDPROC(wnd_proc)
+
+        wc = _WNDCLASS()
+        wc.lpfnWndProc = ctypes.cast(self._wndproc_ref, ctypes.c_void_p)
+        wc.hInstance = h_instance
+        wc.lpszClassName = self.class_name
+        atom = user32.RegisterClassW(ctypes.byref(wc))
+        if not atom:
+            print("RegisterClassW failed:", ctypes.get_last_error())
+
+        HWND_MESSAGE = ctypes.c_void_p(-3)
+        self.hwnd = user32.CreateWindowExW(
+            0, self.class_name, "CrosshairMsg", 0,
+            0, 0, 0, 0,
+            HWND_MESSAGE, None, h_instance, None
+        )
+        if not self.hwnd:
+            print("CreateWindowExW failed:", ctypes.get_last_error())
+            return
+
+        threading.Thread(target=self._msg_loop, daemon=True).start()
+
+    def _msg_loop(self):
+        msg = wintypes.MSG()
+        while user32.GetMessageW(ctypes.byref(msg), self.hwnd, 0, 0) != 0:
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageW(ctypes.byref(msg))
+
+    def register(self, name, vk):
+        if not self.hwnd:
+            return False
+        hk_id = self._next_id
+        self._next_id += 1
+        ok = user32.RegisterHotKey(self.hwnd, hk_id, MOD_NOREPEAT, vk)
+        if ok:
+            self.hk_ids[name] = hk_id
+            self.hk_keys[name] = vk
+        return bool(ok)
+
+    def unregister_all(self):
+        if not self.hwnd:
+            return
+        for name, hk_id in list(self.hk_ids.items()):
+            try:
+                user32.UnregisterHotKey(self.hwnd, hk_id)
+            except Exception:
+                pass
+        self.hk_ids.clear()
+        self.hk_keys.clear()
+
+    def poll(self):
+        """Забираем нажатия из очереди в главном потоке."""
+        try:
+            while True:
+                hk_id = self.ui_queue.get_nowait()
+                # Найдём имя по id
+                for name, hid in self.hk_ids.items():
+                    if hid == hk_id:
+                        try:
+                            self.on_hotkey(name)
+                        except Exception as e:
+                            print("hotkey callback:", e)
+                        break
+        except queue.Empty:
+            pass
+
+
+# ============================================================
+#   Остальное
+# ============================================================
 
 def load_config():
     cfg = {
@@ -103,18 +258,6 @@ def load_config():
                           "version", "hotkeys", "close_to_tray"):
                     if k in saved:
                         cfg[k] = saved[k]
-            # При апдейте версии доливаем дефолтные прицелы, не затирая пользовательские
-            saved_version = saved.get("version", 1)
-            if saved_version < CONFIG_VERSION:
-                for name, p in DEFAULT_PRESETS.items():
-                    if name not in cfg["presets"]:
-                        cfg["presets"][name] = copy.deepcopy(p)
-                cfg.setdefault("hotkeys", {})
-                cfg["hotkeys"].setdefault("toggle_overlay", "F8")
-                cfg["hotkeys"].setdefault("next_preset", "F9")
-                cfg["hotkeys"].setdefault("prev_preset", "F10")
-                cfg.setdefault("close_to_tray", True)
-                cfg["version"] = CONFIG_VERSION
         except Exception as e:
             print("config load:", e)
 
@@ -217,24 +360,23 @@ class Overlay:
 
     def _make_overlay(self):
         try:
-            import ctypes
-            user32 = ctypes.windll.user32
-            hwnd = user32.GetParent(self.win.winfo_id()) or self.win.winfo_id()
+            u = ctypes.windll.user32
+            hwnd = u.GetParent(self.win.winfo_id()) or self.win.winfo_id()
             GWL_EXSTYLE = -20
             WS_EX_LAYERED = 0x00080000
             WS_EX_TRANSPARENT = 0x00000020
             WS_EX_TOOLWINDOW = 0x00000080
-            ex = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            ex = u.GetWindowLongW(hwnd, GWL_EXSTYLE)
             ex |= WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW
-            user32.SetWindowLongW(hwnd, GWL_EXSTYLE, ex)
+            u.SetWindowLongW(hwnd, GWL_EXSTYLE, ex)
             LWA_COLORKEY = 0x00000001
-            user32.SetLayeredWindowAttributes(hwnd, 0x000000, 0, LWA_COLORKEY)
+            u.SetLayeredWindowAttributes(hwnd, 0x000000, 0, LWA_COLORKEY)
             HWND_TOPMOST = -1
             SWP_NOMOVE, SWP_NOSIZE = 0x0002, 0x0001
             SWP_NOACTIVATE, SWP_SHOWWINDOW = 0x0010, 0x0040
-            user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
-                                SWP_NOMOVE | SWP_NOSIZE |
-                                SWP_NOACTIVATE | SWP_SHOWWINDOW)
+            u.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                           SWP_NOMOVE | SWP_NOSIZE |
+                           SWP_NOACTIVATE | SWP_SHOWWINDOW)
         except Exception as e:
             print("overlay setup:", e)
 
@@ -344,8 +486,8 @@ class App:
         self._updating = False
         self.overlay = None
         self.tray_icon = None
-        self._hotkey_ids = {}
-        self._hotkey_counter = 10
+
+        self.hotkey_mgr = GlobalHotkeyManager(on_hotkey=self._on_hotkey)
 
         self.root = tk.Tk()
         self.root.title("Crosshair Overlay")
@@ -357,12 +499,53 @@ class App:
         self._apply_theme()
 
         self.root.after(200, self._create_overlay)
-        self.root.protocol("WM_DELETE_WINDOW", self.on_close_request)
+
+        # Запускаем хоткеи после создания окна Tk
+        self.hotkey_mgr.start()
         self._register_all_hotkeys()
-        self._start_hotkey_poll()
+
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close_request)
         self._start_tray()
 
+        self._poll_hotkeys()
         self.root.mainloop()
+
+    # ---------- хоткеи ----------
+    def _register_all_hotkeys(self):
+        self.hotkey_mgr.unregister_all()
+        hk = self.cfg.get("hotkeys", {})
+        for name, default in (("toggle_overlay", "F8"),
+                              ("next_preset", "F9"),
+                              ("prev_preset", "F10")):
+            key_name = hk.get(name, default)
+            vk = HOTKEY_CHOICES.get(key_name)
+            if vk is None:
+                continue
+            ok = self.hotkey_mgr.register(name, vk)
+            print(f"Хоткей {key_name} ({name}) -> {ok}")
+        self._update_hotkey_hint()
+
+    def _poll_hotkeys(self):
+        self.hotkey_mgr.poll()
+        self.root.after(50, self._poll_hotkeys)
+
+    def _on_hotkey(self, name):
+        if name == "toggle_overlay":
+            self.toggle_overlay()
+        elif name == "next_preset":
+            self.next_preset()
+        elif name == "prev_preset":
+            self.prev_preset()
+
+    def _update_hotkey_hint(self):
+        hk = self.cfg.get("hotkeys", {})
+        text = (f'Хоткеи: {hk.get("toggle_overlay","F8")} — показать/скрыть · '
+                f'{hk.get("next_preset","F9")} — след. · '
+                f'{hk.get("prev_preset","F10")} — пред.')
+        try:
+            self.hotkey_hint.configure(text=text)
+        except Exception:
+            pass
 
     # ---------- UI ----------
     def _build_ui(self):
@@ -385,10 +568,8 @@ class App:
         self.preset_list.pack(fill="y", expand=True, pady=4)
         self.preset_list.bind("<<ListboxSelect>>", self._on_preset_select)
         self.preset_list.bind("<Double-Button-1>", lambda e: self._rename_preset())
-        # ПКМ — контекстное меню
         self.preset_list.bind("<Button-3>", self._on_preset_right_click)
 
-        # Меню для ПКМ
         self.ctx_menu = tk.Menu(self.root, tearoff=0)
         self.ctx_menu.add_command(label="Переименовать", command=self._rename_preset)
         self.ctx_menu.add_command(label="Дублировать", command=self._duplicate_preset)
@@ -493,16 +674,6 @@ class App:
         s.grid(row=row, column=1, sticky="ew", pady=2)
         return s
 
-    def _update_hotkey_hint(self):
-        hk = self.cfg.get("hotkeys", {})
-        text = (f'Хоткеи: {hk.get("toggle_overlay","F8")} — показать/скрыть · '
-                f'{hk.get("next_preset","F9")} — след. · '
-                f'{hk.get("prev_preset","F10")} — пред.')
-        try:
-            self.hotkey_hint.configure(text=text)
-        except Exception:
-            pass
-
     # ---------- логика ----------
     def _on_param_change(self, *args):
         if self._updating:
@@ -594,14 +765,12 @@ class App:
             self._select_preset(name)
 
     def _on_preset_right_click(self, event):
-        """ПКМ по элементу списка: выбираем его и показываем меню."""
         idx = self.preset_list.nearest(event.y)
         if idx < 0:
             return
         bbox = self.preset_list.bbox(idx)
         if bbox is None:
             return
-        # Проверяем, что клик действительно внутри строки
         x, y, w, h = bbox
         if not (y <= event.y <= y + h):
             return
@@ -678,24 +847,18 @@ class App:
         save_config(self.cfg)
         self._select_preset(name)
 
-    # ---------- импорт/экспорт библиотеки ----------
+    # ---------- импорт/экспорт ----------
     def _export_library(self):
         path = filedialog.asksaveasfilename(
-            parent=self.root,
-            defaultextension=".json",
+            parent=self.root, defaultextension=".json",
             filetypes=[("Crosshair library", "*.json"), ("All files", "*.*")],
             initialfile="crosshairs.json",
-            title="Сохранить библиотеку прицелов",
-        )
+            title="Сохранить библиотеку прицелов")
         if not path:
             return
         try:
-            data = {
-                "version": CONFIG_VERSION,
-                "presets": self.cfg["presets"],
-                "current": self.cfg["current"],
-                "exported_at": __import__("datetime").datetime.now().isoformat(),
-            }
+            data = {"version": CONFIG_VERSION, "presets": self.cfg["presets"],
+                    "current": self.cfg["current"]}
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
             messagebox.showinfo("Готово",
@@ -708,8 +871,7 @@ class App:
         path = filedialog.askopenfilename(
             parent=self.root,
             filetypes=[("Crosshair library", "*.json"), ("All files", "*.*")],
-            title="Загрузить библиотеку прицелов",
-        )
+            title="Загрузить библиотеку прицелов")
         if not path:
             return
         try:
@@ -728,12 +890,9 @@ class App:
             f"Найдено {len(presets)} прицелов.\n\n"
             f"«Да» — добавить к текущим (дубликаты получат суффикс).\n"
             f"«Нет» — заменить текущую библиотеку.\n"
-            f"«Отмена» — отменить.",
-            parent=self.root,
-        )
+            f"«Отмена» — отменить.", parent=self.root)
         if mode is None:
             return
-
         if mode:
             added = 0
             for name, p in presets.items():
@@ -751,7 +910,6 @@ class App:
             messagebox.showinfo("Готово",
                                 f"Загружено {len(self.cfg['presets'])} прицелов.",
                                 parent=self.root)
-
         save_config(self.cfg)
         self._refresh_preset_list()
         self._select_preset(self.cfg["current"])
@@ -781,77 +939,6 @@ class App:
             return
         i = names.index(self.cfg["current"]) if self.cfg["current"] in names else 0
         self._select_preset(names[(i - 1) % len(names)])
-
-    # ---------- хоткеи ----------
-    def _register_hotkey(self, name, key_name):
-        try:
-            import ctypes
-            user32 = ctypes.windll.user32
-            vk = HOTKEY_CHOICES.get(key_name)
-            if vk is None:
-                return False
-            hwnd = self.root.winfo_id()
-            hk_id = self._hotkey_counter
-            self._hotkey_counter += 1
-            if not user32.RegisterHotKey(hwnd, hk_id, MOD_NOREPEAT, vk):
-                print(f"RegisterHotKey: {key_name} занята")
-                return False
-            self._hotkey_ids[name] = (hk_id, vk)
-            return True
-        except Exception as e:
-            print("register hotkey:", e)
-            return False
-
-    def _unregister_all_hotkeys(self):
-        try:
-            import ctypes
-            user32 = ctypes.windll.user32
-            hwnd = self.root.winfo_id()
-            for name, (hk_id, vk) in list(self._hotkey_ids.items()):
-                try:
-                    user32.UnregisterHotKey(hwnd, hk_id)
-                except Exception:
-                    pass
-            self._hotkey_ids.clear()
-        except Exception as e:
-            print("unregister hotkey:", e)
-
-    def _register_all_hotkeys(self):
-        self._unregister_all_hotkeys()
-        hk = self.cfg.get("hotkeys", {})
-        self._register_hotkey("toggle_overlay", hk.get("toggle_overlay", "F8"))
-        self._register_hotkey("next_preset", hk.get("next_preset", "F9"))
-        self._register_hotkey("prev_preset", hk.get("prev_preset", "F10"))
-        self._update_hotkey_hint()
-
-    def _start_hotkey_poll(self):
-        try:
-            import ctypes
-            from ctypes import wintypes
-            user32 = ctypes.windll.user32
-            hwnd = self.root.winfo_id()
-
-            def poll():
-                msg = wintypes.MSG()
-                while user32.PeekMessageW(ctypes.byref(msg), hwnd, 0, 0, 1):
-                    if msg.message == 0x0312:
-                        hk_id = msg.wParam
-                        for name, (hid, vk) in self._hotkey_ids.items():
-                            if hid == hk_id:
-                                if name == "toggle_overlay":
-                                    self.toggle_overlay()
-                                elif name == "next_preset":
-                                    self.next_preset()
-                                elif name == "prev_preset":
-                                    self.prev_preset()
-                                break
-                    user32.TranslateMessage(ctypes.byref(msg))
-                    user32.DispatchMessageW(ctypes.byref(msg))
-                self.root.after(50, poll)
-
-            self.root.after(50, poll)
-        except Exception as e:
-            print("hotkey poll:", e)
 
     def _open_hotkeys_dialog(self):
         HotkeysDialog(self.root, THEMES[self.cfg["theme"]],
@@ -925,7 +1012,10 @@ class App:
 
     def _real_exit(self):
         save_config(self.cfg)
-        self._unregister_all_hotkeys()
+        try:
+            self.hotkey_mgr.unregister_all()
+        except Exception:
+            pass
         if self.tray_icon:
             try:
                 self.tray_icon.stop()
